@@ -2,7 +2,8 @@
 import json
 import pathlib
 import os
-from LoRA import MyLoraConfig, inject_lora_layers, get_lora_optimizer, LoRALayerWrapper
+import math
+from utils.LoRA import MyLoraConfig, inject_lora_layers, get_lora_optimizer, LoRALayerWrapper
 
 os.environ["TRANSFORMERS_NO_MLX"] = "1"
 
@@ -11,6 +12,8 @@ sys.modules["mlx"] = None
 sys.modules["mlx.core"] = None
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -31,55 +34,76 @@ model_name=BASE_ROOT/"Qwen"
 train_data = []
 test_data = []
 
-new_train_data=json.load(open(str(BASE_ROOT / 'data' / 'PsyDTCorpus_train_mulit_turn_packing.json')))
+
+# ====== 数据加载异常处理 ======
+train_json_path = BASE_ROOT / 'data' / 'PsyDTCorpus_train_mulit_turn_packing.json'
+try:
+    with open(str(train_json_path), 'r', encoding='utf-8') as f:
+        new_train_data = json.load(f)
+except FileNotFoundError:
+    print(f"训练数据文件未找到: {train_json_path}")
+    exit(1)
+except json.JSONDecodeError as e:
+    print(f"训练数据JSON解析失败: {e}")
+    exit(1)
+
 for item in new_train_data:
-    messages = item["messages"]
-    # 提取system提示（固定在开头）
-    system_prompt = next(msg["content"] for msg in messages if msg["role"] == "system")
-    # 拼接多轮对话（除最后一条assistant回复外，均作为prompt的一部分）
-    prompt_parts = [f"system: {system_prompt}"]
-    response = ""
-    # 遍历消息，收集对话历史和最后一条assistant回复
-    for msg in messages:
-        if msg["role"] == "user":
-            prompt_parts.append(f"user: {msg['content']}")
-        elif msg["role"] == "assistant":
-            # 最后一条assistant消息作为response，前面的作为prompt
-            if msg == messages[-1]:
-                response = msg["content"]
-            else:
-                prompt_parts.append(f"assistant: {msg['content']}")
-    # 拼接完整prompt
-    prompt = "\n".join(prompt_parts)
-    train_data.append({"prompt": prompt, "response": response})
+    try:
+        messages = item["messages"]
+        system_prompt = next(msg["content"] for msg in messages if msg["role"] == "system")
+        prompt_parts = [f"system: {system_prompt}"]
+        response = ""
+        for msg in messages:
+            if msg["role"] == "user":
+                prompt_parts.append(f"user: {msg['content']}")
+            elif msg["role"] == "assistant":
+                if msg == messages[-1]:
+                    response = msg["content"]
+                else:
+                    prompt_parts.append(f"assistant: {msg['content']}")
+        prompt = "\n".join(prompt_parts)
+        train_data.append({"prompt": prompt, "response": response})
+    except Exception as e:
+        print(f"训练数据处理异常: {e}")
 
 train_dataset = Dataset.from_list(train_data)
 
 
-new_test_data=json.load(open(str(BASE_ROOT / 'data' / 'PsyDTCorpus_test_single_turn_split.json')))
+
+# ====== 测试数据加载异常处理 ======
+test_json_path = BASE_ROOT / 'data' / 'PsyDTCorpus_test_single_turn_split.json'
+try:
+    with open(str(test_json_path), 'r', encoding='utf-8') as f:
+        new_test_data = json.load(f)
+except FileNotFoundError:
+    print(f"测试数据文件未找到: {test_json_path}")
+    exit(1)
+except json.JSONDecodeError as e:
+    print(f"测试数据JSON解析失败: {e}")
+    exit(1)
+
 for item in new_test_data:
-    messages = item["messages"]
-    # 提取system提示（固定在开头）
-    system_prompt = next(msg["content"] for msg in messages if msg["role"] == "system")
-    # 拼接多轮对话（除最后一条assistant回复外，均作为prompt的一部分）
-    prompt_parts = [f"system: {system_prompt}"]
-    response = ""
-    # 遍历消息，收集对话历史和最后一条assistant回复
-    for msg in messages:
-        if msg["role"] == "user":
-            prompt_parts.append(f"user: {msg['content']}")
-        elif msg["role"] == "assistant":
-            # 最后一条assistant消息作为response，前面的作为prompt
-            if msg == messages[-1]:
-                response = msg["content"]
-            else:
-                prompt_parts.append(f"assistant: {msg['content']}")
-    # 拼接完整prompt
-    prompt = "\n".join(prompt_parts)
-    test_data.append({"prompt": prompt, "response": response})
+    try:
+        messages = item["messages"]
+        system_prompt = next(msg["content"] for msg in messages if msg["role"] == "system")
+        prompt_parts = [f"system: {system_prompt}"]
+        response = ""
+        for msg in messages:
+            if msg["role"] == "user":
+                prompt_parts.append(f"user: {msg['content']}")
+            elif msg["role"] == "assistant":
+                if msg == messages[-1]:
+                    response = msg["content"]
+                else:
+                    prompt_parts.append(f"assistant: {msg['content']}")
+        prompt = "\n".join(prompt_parts)
+        test_data.append({"prompt": prompt, "response": response})
+    except Exception as e:
+        print(f"测试数据处理异常: {e}")
 
 test_dataset = Dataset.from_list(test_data)
-
+for i in range(5):
+    print(train_data[i])
 
 def preprocess_function(examples):
     # 处理输入prompt，添加padding
@@ -118,16 +142,23 @@ def preprocess_function(examples):
     inputs["labels"] = full_labels
     return inputs
 
-# 加载模型和分词器
-tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-# 新增：配置8bit量化参数（替代原load_in_8bit=True）
+# ====== 模型和分词器加载异常处理 ======
+try:
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+except Exception as e:
+    print(f"分词器加载失败: {e}")
+    exit(1)
 
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16,
-    device_map="auto"
-)
+try:
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
+except Exception as e:
+    print(f"模型加载失败: {e}")
+    exit(1)
 tokenizer.pad_token = tokenizer.eos_token
 
 # print("模型模块列表：")
@@ -193,49 +224,103 @@ scheduler = get_linear_schedule_with_warmup(
     num_training_steps=total_steps
 )
 
-# 创建Trainer并训练
+
+# ===================== 断点续训功能 =====================
+import glob
+def get_latest_checkpoint(output_dir):
+    checkpoints = glob.glob(os.path.join(output_dir, "checkpoint-*") )
+    if not checkpoints:
+        return None
+    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[-1]))
+    return checkpoints[-1]
+
+
+# ====== 断点检测异常处理 ======
+try:
+    resume_checkpoint = get_latest_checkpoint(training_args.output_dir)
+    if resume_checkpoint:
+        print(f"检测到断点: {resume_checkpoint}，将从断点继续训练...")
+    else:
+        print("未检测到断点，将从头开始训练...")
+except Exception as e:
+    print(f"断点检测异常: {e}")
+    resume_checkpoint = None
+
+
 if use_peft:
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
-        optimizers=(optimizer, scheduler),  # 使用自定义优化器
-    )
-    trainer.train(resume_from_checkpoint=True)
-    model = model.merge_and_unload()
-    model.save_pretrained("./qwen_lora_merged")
-    tokenizer.save_pretrained("./qwen_lora_merged")
+    try:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=test_dataset,
+            optimizers=(optimizer, scheduler),  # 使用自定义优化器
+        )
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
+        model = model.merge_and_unload()
+        model.save_pretrained("./qwen_lora_merged")
+        tokenizer.save_pretrained("./qwen_lora_merged")
+    except Exception as e:
+        print(f"训练过程异常: {e}")
+        exit(1)
 else:
-    # PyTorch原生训练流程
-    from torch.utils.data import DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    max_grad_norm = 1.0
-    model.train()
-    for epoch in range(3):
-        total_loss = 0.0
-        step = 0
-        for batch in train_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-            total_loss += loss.item()
-            step += 1
-            print(f"Epoch {epoch+1} | Step {step} | Loss: {loss.item():.4f}")
-        avg_loss = total_loss / step if step > 0 else 0
-        print(f"Epoch {epoch+1} finished. Avg Loss: {avg_loss:.4f}")
-    # 合并LoRA权重并保存
-    for module in model.modules():
-        if isinstance(module, LoRALayerWrapper):
-            module.merge()
-    model.save_pretrained("./qwen_lora_merged")
-    tokenizer.save_pretrained("./qwen_lora_merged")
+    # PyTorch原生训练流程，支持断点续训
+    try:
+        from torch.utils.data import DataLoader
+        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        max_grad_norm = 1.0
+        start_epoch = 0
+        # 检查是否有断点
+        checkpoint_path = get_latest_checkpoint("./qwen_lora_finetuned")
+        if checkpoint_path:
+            print(f"加载断点: {checkpoint_path}")
+            try:
+                state = torch.load(os.path.join(checkpoint_path, "pytorch_model.bin"), map_location=device)
+                model.load_state_dict(state, strict=False)
+            except Exception as e:
+                print(f"断点加载失败: {e}")
+        model.train()
+        for epoch in range(start_epoch, 3):
+            total_loss = 0.0
+            step = 0
+            for batch in train_loader:
+                try:
+                    input_ids = batch["input_ids"].to(device)
+                    attention_mask = batch["attention_mask"].to(device)
+                    labels = batch["labels"].to(device)
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = outputs.loss
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    total_loss += loss.item()
+                    step += 1
+                    print(f"Epoch {epoch+1} | Step {step} | Loss: {loss.item():.4f}")
+                except Exception as e:
+                    print(f"训练step异常: {e}")
+            avg_loss = total_loss / step if step > 0 else 0
+            print(f"Epoch {epoch+1} finished. Avg Loss: {avg_loss:.4f}")
+            # 保存断点
+            save_dir = f"./qwen_lora_finetuned/checkpoint-{epoch+1}"
+            try:
+                os.makedirs(save_dir, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
+                print(f"已保存断点: {save_dir}")
+            except Exception as e:
+                print(f"断点保存失败: {e}")
+        # 合并LoRA权重并保存
+        for module in model.modules():
+            if isinstance(module, LoRALayerWrapper):
+                module.merge()
+        try:
+            model.save_pretrained("./qwen_lora_merged")
+            tokenizer.save_pretrained("./qwen_lora_merged")
+        except Exception as e:
+            print(f"模型保存失败: {e}")
+    except Exception as e:
+        print(f"训练主流程异常: {e}")
+        exit(1)
