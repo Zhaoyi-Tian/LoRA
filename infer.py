@@ -2,17 +2,46 @@ import pathlib
 import random
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-lora=True
+import os
+import sys
 BASE_ROOT = pathlib.Path(__file__).resolve().parent
 random.seed(1234)
-# 加载模型和分词器
-if not lora:
+
+# ====== 是否使用自定义LoRA权重 ======
+use_custom_lora = True  # 设置为True则使用自己实现的LoRA权重
+
+if use_custom_lora:
+	# 加载原始模型和分词器
 	model_name = str(BASE_ROOT / 'Qwen')
 	tokenizer = AutoTokenizer.from_pretrained(model_name)
 	model = AutoModelForCausalLM.from_pretrained(model_name).to("cuda")
-	model.eval()  # 设置为评估模式
+	# 注入自定义LoRA层
+	from utils.LoRA import MyLoraConfig, inject_lora_layers
+	lora_config = MyLoraConfig(
+		r=8,
+		lora_alpha=16,
+		target_modules=["q_proj", "k_proj", "v_proj"],
+		lora_dropout=0.05
+	)
+	model = inject_lora_layers(model, lora_config)
+	# 加载自定义LoRA权重（断点权重）
+	checkpoint_path = BASE_ROOT / "qwen_lora_finetuned" / "checkpoint-3" / "pytorch_model.bin"
+	if checkpoint_path.exists():
+		print(f"[INFO] 加载自定义LoRA权重: {checkpoint_path}")
+		state = torch.load(str(checkpoint_path), map_location="cuda")
+		model.load_state_dict(state, strict=False)
+	else:
+		print(f"[WARN] 未找到自定义LoRA权重，将仅使用原始模型")
+	model.eval()
 else:
-	model_name = str(BASE_ROOT /'qwen_lora_merged')
+	# 兼容原有peft包训练的LoRA模型
+	lora_model_path = BASE_ROOT / 'qwen_lora_merged'
+	if lora_model_path.exists():
+		model_name = str(lora_model_path)
+		print("[INFO] 正在加载peft包训练的LoRA模型: qwen_lora_merged")
+	else:
+		model_name = str(BASE_ROOT / 'Qwen')
+		print("[INFO] 未检测到LoRA模型，加载原始模型: Qwen")
 	tokenizer = AutoTokenizer.from_pretrained(model_name)
 	model = AutoModelForCausalLM.from_pretrained(model_name).to("cuda")
 	model.eval()
